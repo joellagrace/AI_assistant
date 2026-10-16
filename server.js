@@ -180,9 +180,16 @@ async function searchProducts(userMessage) {
       .sort((a, b) => b.score - a.score)
       .map(s => s.product);
 
+    // Hide mountings unless user explicitly asked for them
+    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage);
+    const filterMountings = (list) => wantsMounting
+      ? list
+      : list.filter(p => !/\bmount(ing)?\b/i.test(p.title));
+
     // If nothing matched, return newest products
     const finalResults = matched.length > 0 ? matched : results;
-    return finalResults.slice(0, 4).map(formatProduct);
+    const filtered = filterMountings(finalResults);
+    return (filtered.length > 0 ? filtered : finalResults).slice(0, 4).map(formatProduct);
 
   } catch (err) {
     console.error('searchProducts error:', err);
