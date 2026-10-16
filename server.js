@@ -51,25 +51,22 @@ async function redisSet(key, value, ttl) {
       },
       body: JSON.stringify(JSON.stringify(value))
     });
-  } catch { /* ignore cache write errors */ }
+  } catch { }
 }
 
-// ─── Fetch ALL products from Shopify (used only on cache miss) ────────────────
+// ─── Fetch ALL products from Shopify ─────────────────────────────────────────
 async function fetchAllFromShopify() {
   let allProducts = [];
   let url = `${SHOPIFY_URL}/products.json?limit=250&status=active`;
-
   while (url) {
     const res = await fetch(url, {
       headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
     });
     const data = await res.json();
     if (data.products) allProducts = [...allProducts, ...data.products];
-
     const linkHeader = res.headers.get('link');
     const nextMatch = linkHeader && linkHeader.match(/<([^>]+)>;\s*rel="next"/);
     url = nextMatch ? nextMatch[1] : null;
-
     if (allProducts.length >= 5000) break;
   }
   return allProducts;
@@ -77,127 +74,135 @@ async function fetchAllFromShopify() {
 
 // ─── Get products (from cache or Shopify) ────────────────────────────────────
 async function getAllProducts() {
-  // 1. Try Redis cache first
   const cached = await redisGet(CACHE_KEY);
   if (cached && cached.length > 0) {
     console.log(`Cache hit: ${cached.length} products`);
     return cached;
   }
-
-  // 2. Cache miss → fetch from Shopify
   console.log('Cache miss — fetching from Shopify...');
   const products = await fetchAllFromShopify();
-
-  // 3. Store in Redis for next 30 minutes
-  if (products.length > 0) {
-    await redisSet(CACHE_KEY, products, CACHE_TTL);
-    console.log(`Cached ${products.length} products for 30 min`);
-  }
-
+  if (products.length > 0) await redisSet(CACHE_KEY, products, CACHE_TTL);
   return products;
 }
 
-// ─── Search & filter products ─────────────────────────────────────────────────
-async function searchProducts(query, intent = {}) {
+// ─── Step 1: Use OpenAI to extract a clean search query ──────────────────────
+async function extractSearchQuery(userMessage) {
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 60,
+      messages: [
+        {
+          role: 'system',
+          content: `You are a search query extractor for a jewelry store.
+Extract a simple 1-3 word product search query from the user's message.
+Return ONLY the search query, nothing else.
+Examples:
+- "show me some ruby rings" → "ruby ring"
+- "I want something cheap" → "affordable"
+- "show me expensive pieces" → "expensive"
+- "do you have sapphire necklaces?" → "sapphire necklace"
+- "what engagement rings do you have" → "engagement ring"
+- "show me vintage bracelets" → "vintage bracelet"
+- "cheapest items" → "cheapest"
+- "most expensive" → "most expensive"
+- "newest arrivals" → "newest"
+If no clear product query, return "jewelry".`
+        },
+        { role: 'user', content: userMessage }
+      ]
+    });
+    return res.choices[0].message.content.trim().toLowerCase();
+  } catch {
+    return userMessage.toLowerCase();
+  }
+}
+
+// ─── Step 2: Search products using extracted query ────────────────────────────
+async function searchProducts(userMessage) {
   try {
     const allProducts = await getAllProducts();
     if (allProducts.length === 0) return [];
 
+    // Get AI-extracted search query
+    const searchQuery = await extractSearchQuery(userMessage);
+    console.log(`Search query: "${searchQuery}"`);
+
+    const terms = searchQuery.split(' ').filter(t => t.length > 1);
     let results = [...allProducts];
 
-    // Color filter
-    if (intent.color) {
-      const colored = results.filter(p =>
-        p.title.toLowerCase().includes(intent.color) ||
-        (p.tags && p.tags.toLowerCase().includes(intent.color)) ||
-        (p.body_html && p.body_html.toLowerCase().includes(intent.color)) ||
-        (p.variants && p.variants.some(v => v.title.toLowerCase().includes(intent.color)))
-      );
-      if (colored.length > 0) results = colored;
-    }
-
-    // Product keyword filter
-    if (intent.keyword) {
-      const keyworded = results.filter(p =>
-        p.title.toLowerCase().includes(intent.keyword) ||
-        (p.product_type && p.product_type.toLowerCase().includes(intent.keyword)) ||
-        (p.tags && p.tags.toLowerCase().includes(intent.keyword))
-      );
-      if (keyworded.length > 0) results = keyworded;
-    }
-
-    // Sort across ALL products
-    if (intent.sort === 'cheapest') {
+    // Handle sort intents
+    if (/cheap|lowest|affordable|budget|least expensive|low price/.test(searchQuery)) {
       results.sort((a, b) =>
         parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)
       );
-    } else if (intent.sort === 'expensive') {
+      return results.slice(0, 4).map(formatProduct);
+    }
+
+    if (/expensive|highest|luxury|most costly|priciest|high end|high-end|most expensive/.test(searchQuery)) {
       results.sort((a, b) =>
         parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)
       );
-    } else if (intent.sort === 'latest') {
-      results.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    } else if (intent.sort === 'oldest') {
-      results.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      return results.slice(0, 4).map(formatProduct);
     }
 
-    return results.slice(0, 4).map(p => ({
-      title: p.title,
-      price: p.variants[0]?.price || '0.00',
-      image: p.images[0]?.src || null,
-      url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`,
-      inStock: p.variants.some(v => v.inventory_quantity > 0)
-    }));
+    if (/new|latest|newest|recent/.test(searchQuery)) {
+      results.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      return results.slice(0, 4).map(formatProduct);
+    }
+
+    if (/old|oldest|classic|earliest/.test(searchQuery)) {
+      results.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      return results.slice(0, 4).map(formatProduct);
+    }
+
+    // Score each product by how many terms match
+    const scored = results.map(p => {
+      const searchText = [
+        p.title,
+        p.product_type,
+        p.tags,
+        p.body_html?.replace(/<[^>]*>/g, '') || ''
+      ].join(' ').toLowerCase();
+
+      let score = 0;
+      terms.forEach(term => {
+        if (searchText.includes(term)) score++;
+        // Bonus for title match
+        if (p.title.toLowerCase().includes(term)) score += 2;
+      });
+      return { product: p, score };
+    });
+
+    // Sort by score, filter out zero matches
+    const matched = scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(s => s.product);
+
+    // If nothing matched, return newest products
+    const finalResults = matched.length > 0 ? matched : results;
+    return finalResults.slice(0, 4).map(formatProduct);
+
   } catch (err) {
     console.error('searchProducts error:', err);
     return [];
   }
 }
 
-// ─── Intent detection ─────────────────────────────────────────────────────────
-function detectIntent(msg) {
-  const lower = msg.toLowerCase();
-  const intent = {};
-
-  if (lower.includes('yellow gold')) intent.color = 'yellow gold';
-  else if (lower.includes('white gold')) intent.color = 'white gold';
-  else if (lower.includes('rose gold')) intent.color = 'rose gold';
-  else if (lower.includes('platinum')) intent.color = 'platinum';
-  else {
-    const colors = ['red', 'blue', 'green', 'yellow', 'white', 'black',
-                    'rose', 'pink', 'purple', 'orange', 'brown', 'grey', 'gray'];
-    colors.forEach(c => { if (lower.includes(c)) intent.color = c; });
-  }
-
-  const keywords = ['ring', 'necklace', 'earring', 'bracelet', 'pendant',
-                    'brooch', 'diamond', 'engagement', 'wedding', 'cross', 'coin'];
-  keywords.forEach(k => { if (lower.includes(k)) intent.keyword = k; });
-
-  if (/cheap|lowest|affordable|budget|least expensive|low price/.test(lower)) {
-    intent.sort = 'cheapest';
-  } else if (/expensive|highest|luxury|most costly|priciest|high end|high-end|most expensive/.test(lower)) {
-    intent.sort = 'expensive';
-  } else if (/new|latest|newest|recent|just arrived|fresh/.test(lower)) {
-    intent.sort = 'latest';
-  } else if (/old|oldest|classic|earliest/.test(lower)) {
-    intent.sort = 'oldest';
-  }
-
-  return intent;
+function formatProduct(p) {
+  return {
+    title: p.title,
+    price: p.variants[0]?.price || '0.00',
+    image: p.images[0]?.src || null,
+    url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`,
+    inStock: p.variants.some(v => v.inventory_quantity > 0)
+  };
 }
 
-function getResponseText(intent) {
-  if (intent.sort === 'cheapest') return "Here are our most affordable pieces!";
-  if (intent.sort === 'expensive') return "Here are our most luxurious, high-end pieces!";
-  if (intent.sort === 'latest') return "Here are our newest arrivals!";
-  if (intent.sort === 'oldest') return "Here are some of our most classic vintage pieces!";
-  if (intent.color) return `Here are pieces featuring ${intent.color} from our collection!`;
-  if (intent.keyword) return `Here are our beautiful ${intent.keyword} pieces!`;
-  return "Here are some beautiful pieces from our collection!";
-}
-
+// ─── Is this a product query? ─────────────────────────────────────────────────
 function isProductQuery(msg) {
-  return /ring|necklace|earring|bracelet|pendant|brooch|diamond|gold|silver|platinum|vintage|antique|suggest|show me|find me|looking for|engagement|wedding|jewelry|jewellery|collection|piece|buy|shop|cheap|expensive|latest|newest|oldest|affordable|luxury|red|blue|white|rose|yellow|cross|coin/i.test(msg);
+  return /ring|necklace|earring|bracelet|pendant|brooch|diamond|gold|silver|platinum|vintage|antique|suggest|show me|find me|looking for|engagement|wedding|jewelry|jewellery|collection|piece|buy|shop|cheap|expensive|latest|newest|oldest|affordable|luxury|ruby|emerald|sapphire|pearl|opal|garnet|cross|coin|show|suggest|recommend/i.test(msg);
 }
 
 // ─── API endpoint ─────────────────────────────────────────────────────────────
@@ -206,12 +211,14 @@ app.post('/api/chat', async (req, res) => {
     const { message, history = [] } = req.body;
 
     if (isProductQuery(message)) {
-      const intent = detectIntent(message);
-      const products = await searchProducts(message, intent);
-      const responseText = getResponseText(intent);
+      const products = await searchProducts(message);
 
       if (products.length > 0) {
-        return res.json({ type: 'products', text: responseText, products });
+        return res.json({
+          type: 'products',
+          text: "Here are some pieces from our collection!",
+          products
+        });
       }
 
       return res.json({
@@ -241,7 +248,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// ─── Cache refresh endpoint (optional) ───────────────────────────────────────
+// ─── Cache refresh ────────────────────────────────────────────────────────────
 app.post('/api/refresh-cache', async (req, res) => {
   try {
     const products = await fetchAllFromShopify();
