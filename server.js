@@ -203,7 +203,9 @@ function formatProduct(p) {
     price: p.variants[0]?.price || '0.00',
     image: p.images[0]?.src || null,
     url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`,
-    inStock: p.variants.some(v => v.inventory_quantity > 0)
+    inStock: p.variants.some(v => v.inventory_quantity > 0),
+    tags: p.tags || '',
+    product_type: p.product_type || ''
   };
 }
 
@@ -252,6 +254,45 @@ app.post('/api/chat', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+// ─── Related products endpoint ───────────────────────────────────────────────
+app.post('/api/related', async (req, res) => {
+  try {
+    const { title, tags, product_type } = req.body;
+    const allProducts = await getAllProducts();
+    if (!allProducts.length) return res.json({ products: [] });
+
+    const searchTerms = [
+      ...(tags || '').split(',').map(t => t.trim().toLowerCase()).filter(t => t.length > 2),
+      (product_type || '').toLowerCase().trim(),
+    ].filter(Boolean);
+
+    if (searchTerms.length === 0) return res.json({ products: [] });
+
+    const titleLower = (title || '').toLowerCase();
+
+    const scored = allProducts.map(p => {
+      if (p.title.toLowerCase() === titleLower) return { product: p, score: -1 };
+      const searchText = [p.title, p.product_type, p.tags].join(' ').toLowerCase();
+      let score = 0;
+      searchTerms.forEach(term => {
+        if (searchText.includes(term)) score++;
+        if (p.title.toLowerCase().includes(term)) score++;
+      });
+      return { product: p, score };
+    });
+
+    const related = scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map(s => formatProduct(s.product));
+
+    res.json({ products: related });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

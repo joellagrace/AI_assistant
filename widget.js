@@ -1,5 +1,6 @@
 (function () {
   const API_URL = window.JGChat?.apiUrl || 'http://localhost:3000/api/chat';
+  const RELATED_URL = (window.JGChat?.apiUrl || 'http://localhost:3000').replace('/api/chat', '') + '/api/related';
   let history = [];
   let isOpen = false;
 
@@ -321,6 +322,81 @@
       flex-shrink: 0;
     }
 
+    .jg-related-wrap {
+      align-self: flex-start;
+      max-width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .jg-related-label {
+      font-size: 11px;
+      color: #b5a099;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      padding-left: 2px;
+    }
+    .jg-related-row {
+      display: flex;
+      gap: 7px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      scrollbar-width: none;
+    }
+    .jg-related-row::-webkit-scrollbar { display: none; }
+    .jg-related-card {
+      background: #fff;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.08);
+      text-decoration: none;
+      color: inherit;
+      flex-shrink: 0;
+      width: 90px;
+      transition: box-shadow .2s, transform .2s;
+    }
+    .jg-related-card:hover {
+      box-shadow: 0 3px 12px rgba(0,0,0,0.13);
+      transform: translateY(-1px);
+    }
+    .jg-related-img {
+      width: 90px;
+      height: 70px;
+      object-fit: cover;
+      display: block;
+    }
+    .jg-related-img-ph {
+      width: 90px;
+      height: 70px;
+      background: #f0e8e4;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+    .jg-related-info {
+      padding: 5px 6px 6px;
+    }
+    .jg-related-title {
+      font-size: 10px;
+      color: #2a1f1a;
+      font-weight: 500;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.3;
+    }
+    .jg-related-price {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 12px;
+      font-weight: 600;
+      color: #1a1410;
+      margin-top: 2px;
+    }
+
     @media (max-width: 400px) {
       #jg-panel { width: calc(100vw - 24px); right: 12px; }
     }
@@ -446,6 +522,62 @@
     messages.scrollTop = messages.scrollHeight;
   }
 
+  function addRelated(products) {
+    if (!products || products.length === 0) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'jg-related-wrap';
+    const label = document.createElement('div');
+    label.className = 'jg-related-label';
+    label.textContent = '✦ You might also like';
+    wrap.appendChild(label);
+    const row = document.createElement('div');
+    row.className = 'jg-related-row';
+    products.forEach(p => {
+      const a = document.createElement('a');
+      a.className = 'jg-related-card';
+      a.href = p.url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      if (p.image) {
+        const img = document.createElement('img');
+        img.className = 'jg-related-img';
+        img.src = p.image;
+        img.alt = p.title;
+        a.appendChild(img);
+      } else {
+        const ph = document.createElement('div');
+        ph.className = 'jg-related-img-ph';
+        ph.textContent = '💍';
+        a.appendChild(ph);
+      }
+      const info = document.createElement('div');
+      info.className = 'jg-related-info';
+      info.innerHTML = '<div class="jg-related-title">' + p.title + '</div><div class="jg-related-price">$' + parseFloat(p.price).toLocaleString('en-US', {minimumFractionDigits: 0}) + '</div>';
+      a.appendChild(info);
+      row.appendChild(a);
+    });
+    wrap.appendChild(row);
+    messages.appendChild(wrap);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  async function fetchRelated(products) {
+    if (!products || products.length === 0) return;
+    try {
+      const first = products[0];
+      const res = await fetch(RELATED_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: first.title, tags: first.tags || '', product_type: first.product_type || '' })
+      });
+      const data = await res.json();
+      if (data.products && data.products.length > 0) {
+        addRelated(data.products);
+        saveSession();
+      }
+    } catch (e) {}
+  }
+
   function addTyping(msg) {
     const wrap = document.createElement('div');
     wrap.className = 'jg-typing-wrap';
@@ -513,6 +645,7 @@
 
       if (data.type === 'products' && data.products && data.products.length > 0) {
         addProducts(data.text, data.products);
+        fetchRelated(data.products);
       } else {
         addMsg('bot', data.text || 'Sorry, I could not get a response. Please try again.');
       }
