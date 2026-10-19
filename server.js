@@ -205,7 +205,8 @@ function formatProduct(p) {
     url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`,
     inStock: p.variants.some(v => v.inventory_quantity > 0),
     tags: p.tags || '',
-    product_type: p.product_type || ''
+    product_type: p.product_type || '',
+    variant_id: p.variants[0]?.id || null''
   };
 }
 
