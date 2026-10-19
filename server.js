@@ -206,7 +206,7 @@ function formatProduct(p) {
     inStock: p.variants.some(v => v.inventory_quantity > 0),
     tags: p.tags || '',
     product_type: p.product_type || '',
-    variant_id: p.variants[0]?.id || null''
+    variant_id: p.variants[0]?.id || null
   };
 }
 
@@ -270,9 +270,17 @@ app.post('/api/related', async (req, res) => {
       (product_type || '').toLowerCase().trim(),
     ].filter(Boolean);
 
-    if (searchTerms.length === 0) return res.json({ products: [] });
-
     const titleLower = (title || '').toLowerCase();
+
+    // If no search terms, fall back to 3 newest products
+    if (searchTerms.length === 0) {
+      const fallback = [...allProducts]
+        .filter(p => p.title.toLowerCase() !== titleLower)
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, 3)
+        .map(formatProduct);
+      return res.json({ products: fallback });
+    }
 
     const scored = allProducts.map(p => {
       if (p.title.toLowerCase() === titleLower) return { product: p, score: -1 };
@@ -285,13 +293,23 @@ app.post('/api/related', async (req, res) => {
       return { product: p, score };
     });
 
-    const related = scored
+    const matched = scored
       .filter(s => s.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
       .map(s => formatProduct(s.product));
 
-    res.json({ products: related });
+    // If no related found, show 3 newest products as fallback
+    if (matched.length === 0) {
+      const fallback = [...allProducts]
+        .filter(p => p.title.toLowerCase() !== titleLower)
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, 3)
+        .map(formatProduct);
+      return res.json({ products: fallback });
+    }
+
+    res.json({ products: matched });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
