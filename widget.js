@@ -3,6 +3,7 @@
   const RELATED_URL = (window.JGChat?.apiUrl || 'http://localhost:3000').replace('/api/chat', '') + '/api/related';
   let history = [];
   let isOpen = false;
+  let prefetchedProducts = null; // cache for personalized products
 
   const style = document.createElement('style');
   style.textContent = `
@@ -467,6 +468,29 @@
     return Object.entries(count).sort((a,b) => b[1]-a[1]).slice(0,3).map(e => e[0]);
   }
 
+  // ── Prefetch personalized products in background on page load ──
+  async function prefetchPersonalized() {
+    const browsed = getBrowsed();
+    if (browsed.length === 0) return;
+    try {
+      const topTags = getTopTags(browsed);
+      const recent = browsed[browsed.length - 1];
+      const res = await fetch(RELATED_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: recent.title,
+          tags: topTags.join(', '),
+          product_type: recent.product_type || ''
+        })
+      });
+      const data = await res.json();
+      if (data.products && data.products.length > 0) {
+        prefetchedProducts = { products: data.products, topTags, recent };
+      }
+    } catch(e) {}
+  }
+
   async function showPersonalizedWelcome() {
     const browsed = getBrowsed();
 
@@ -476,16 +500,21 @@
       return;
     }
 
-    // Personalized greeting based on browsing history
     const topTags = getTopTags(browsed);
-    const recent = browsed[browsed.length - 1];
     const interestLabel = topTags.slice(0, 2).map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' & ');
-
     addMsg('bot', `Welcome back to Joella Grace ✦ I can see you've been exploring ${interestLabel} pieces — I've curated something special just for you:`);
 
-    const typing = addTyping('Curating picks for you…');
+    // If prefetch already done — show instantly!
+    if (prefetchedProducts) {
+      addProducts('✦ Curated for you', prefetchedProducts.products);
+      saveSession();
+      return;
+    }
 
+    // Fallback: fetch now (first visit or prefetch failed)
+    const typing = addTyping('Curating picks for you…');
     try {
+      const recent = browsed[browsed.length - 1];
       const res = await fetch(RELATED_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -520,6 +549,9 @@
 
   // Restore previous chat on load
   restoreSession();
+
+  // Prefetch personalized products in background (so chat opens instantly)
+  setTimeout(prefetchPersonalized, 1500);
 
   function addMsg(role, text) {
     const div = document.createElement('div');
