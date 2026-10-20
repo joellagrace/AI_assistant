@@ -453,12 +453,64 @@
     } catch(e) {}
   }
 
+  // ── Personalization helpers ─────────────────────────────────────
+  function getBrowsed() {
+    try { return JSON.parse(localStorage.getItem('jg_browsed') || '[]'); } catch { return []; }
+  }
+
+  function getTopTags(browsed) {
+    const allTags = browsed.flatMap(h =>
+      (h.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(t => t.length > 2)
+    );
+    const count = {};
+    allTags.forEach(t => { count[t] = (count[t] || 0) + 1; });
+    return Object.entries(count).sort((a,b) => b[1]-a[1]).slice(0,3).map(e => e[0]);
+  }
+
+  async function showPersonalizedWelcome() {
+    const browsed = getBrowsed();
+
+    if (browsed.length === 0) {
+      addMsg('bot', "Welcome to Joella Grace ✦ Ask me about any piece in our collection, shipping, returns, or custom designs — I'm here to help.");
+      saveSession();
+      return;
+    }
+
+    // Personalized greeting based on browsing history
+    const topTags = getTopTags(browsed);
+    const recent = browsed[browsed.length - 1];
+    const interestLabel = topTags.slice(0, 2).map(t => t.charAt(0).toUpperCase() + t.slice(1)).join(' & ');
+
+    addMsg('bot', `Welcome back to Joella Grace ✦ I can see you've been exploring ${interestLabel} pieces — I've curated something special just for you:`);
+
+    const typing = addTyping('Curating picks for you…');
+
+    try {
+      const res = await fetch(RELATED_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: recent.title,
+          tags: topTags.join(', '),
+          product_type: recent.product_type || ''
+        })
+      });
+      const data = await res.json();
+      typing.remove();
+      if (data.products && data.products.length > 0) {
+        addProducts('✦ Curated for you', data.products);
+      }
+    } catch(e) {
+      typing.remove();
+    }
+    saveSession();
+  }
+
   function toggle() {
     isOpen = !isOpen;
     panel.classList.toggle('open', isOpen);
     if (isOpen && messages.children.length === 0) {
-      addMsg('bot', "Welcome to Joella Grace ✦ Ask me about any piece in our collection, shipping, returns, or custom designs, I'm here to help.");
-      saveSession();
+      showPersonalizedWelcome();
     }
     if (isOpen) {
       messages.scrollTop = messages.scrollHeight;

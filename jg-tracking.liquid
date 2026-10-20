@@ -1,0 +1,23 @@
+{% comment %} Joella Grace — Browsing Tracker for Personalization {% endcomment %}
+{% if template.name == 'product' %}
+<script>
+(function() {
+  try {
+    var product = {
+      title: {{ product.title | json }},
+      tags: {{ product.tags | join: ',' | json }},
+      product_type: {{ product.type | json }}
+    };
+    var browsed = [];
+    try { browsed = JSON.parse(localStorage.getItem('jg_browsed') || '[]'); } catch(e) {}
+    // Remove duplicate
+    browsed = browsed.filter(function(p) { return p.title !== product.title; });
+    // Add to end (most recent last)
+    browsed.push(product);
+    // Keep only last 10 viewed
+    if (browsed.length > 10) browsed = browsed.slice(-10);
+    localStorage.setItem('jg_browsed', JSON.stringify(browsed));
+  } catch(e) {}
+})();
+</script>
+{% endif %}
