@@ -36,8 +36,12 @@ async function redisGet(key) {
   try {
     const res = await fetch(`${REDIS_URL}/get/${key}`, { headers: { Authorization: `Bearer ${REDIS_TOKEN}` } });
     const data = await res.json();
-    return data.result ? JSON.parse(data.result) : null;
-  } catch { return null; }
+    if (!data.result) return null;
+    // Value may have been stored double-encoded — unwrap until we get the real array
+    let v = data.result;
+    for (let i = 0; i < 3 && typeof v === 'string'; i++) v = JSON.parse(v);
+    return Array.isArray(v) ? v : null;
+  } catch (e) { console.error('redisGet error:', e.message); return null; }
 }
 
 async function redisSet(key, value, ttl) {
@@ -98,7 +102,7 @@ async function fetchAllFromShopify() {
 let memCache = { at: 0, data: null };
 async function getAllProducts() {
   const cached = await redisGet(CACHE_KEY);
-  if (cached && cached.length > 0) { console.log(`Cache hit: ${cached.length} products`); return cached; }
+  if (Array.isArray(cached) && cached.length > 0) { console.log(`Cache hit: ${cached.length} products`); return cached; }
   if (memCache.data && Date.now() - memCache.at < CACHE_TTL * 1000) { console.log(`Memory cache hit: ${memCache.data.length}`); return memCache.data; }
   console.log('Cache miss — fetching from Shopify...');
   const products = await fetchAllFromShopify();
