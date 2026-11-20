@@ -14,7 +14,7 @@ const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const CACHE_KEY = 'jg_all_products';
-const CACHE_TTL = 60 * 5; // 5 minutes
+const CACHE_TTL = 60 * 5;
 
 const SYSTEM_PROMPT = `You are a helpful shopping assistant for Joella Grace Jewelry,
 a vintage and antique jewelry store. Be warm, elegant and knowledgeable.
@@ -30,7 +30,6 @@ IMPORTANT: Never make up or invent product names, prices, or descriptions.
 If asked about specific products, only describe what you know about our store generally.
 Keep responses short, warm and friendly.`;
 
-// ─── Redis helpers ────────────────────────────────────────────────────────────
 async function redisGet(key) {
   try {
     const res = await fetch(`${REDIS_URL}/get/${key}`, {
@@ -45,23 +44,17 @@ async function redisSet(key, value, ttl) {
   try {
     await fetch(`${REDIS_URL}/set/${key}?EX=${ttl}`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${REDIS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(JSON.stringify(value))
     });
   } catch { }
 }
 
-// ─── Fetch ALL products from Shopify ─────────────────────────────────────────
 async function fetchAllFromShopify() {
   let allProducts = [];
   let url = `${SHOPIFY_URL}/products.json?limit=250&status=active`;
   while (url) {
-    const res = await fetch(url, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
-    });
+    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } });
     const data = await res.json();
     if (data.products) allProducts = [...allProducts, ...data.products];
     const linkHeader = res.headers.get('link');
@@ -72,35 +65,24 @@ async function fetchAllFromShopify() {
   return allProducts;
 }
 
-// ─── Get products (from cache or Shopify) ────────────────────────────────────
 async function getAllProducts() {
   const cached = await redisGet(CACHE_KEY);
-  if (cached && cached.length > 0) {
-    console.log(`Cache hit: ${cached.length} products`);
-    return cached;
-  }
+  if (cached && cached.length > 0) { console.log(`Cache hit: ${cached.length} products`); return cached; }
   console.log('Cache miss — fetching from Shopify...');
   const products = await fetchAllFromShopify();
   if (products.length > 0) await redisSet(CACHE_KEY, products, CACHE_TTL);
   return products;
 }
 
-// ─── Live Shopify search (real-time, exact title match) ───────────────────────
 async function searchShopifyLive(query) {
   try {
-    const url = `${SHOPIFY_URL}/products.json?limit=10&status=active&title=${encodeURIComponent(query)}`;
-    const res = await fetch(url, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
-    });
+    const url = `${SHOPIFY_URL}/products.json?limit=15&status=active&title=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } });
     const data = await res.json();
     return data.products || [];
-  } catch (err) {
-    console.error('Shopify live search error:', err);
-    return [];
-  }
+  } catch (err) { console.error('Shopify live search error:', err); return []; }
 }
 
-// ─── AI: Detect intent + extract search query (no hardcoding) ────────────────
 async function analyzeMessage(userMessage) {
   try {
     const res = await openai.chat.completions.create({
@@ -113,19 +95,31 @@ async function analyzeMessage(userMessage) {
 Analyze the user message and return a JSON object with two fields:
 - "isProduct": true if the user is asking about, looking for, or inquiring about ANY product or item in the store (jewelry, watches, accessories, antiques, coins, etc.), false if it's a general question (shipping, returns, policies, custom design, greetings).
 - "query": a simple 1-3 word search term (e.g. "ruby ring", "watch", "affordable", "newest", "most expensive"). If no specific product, return "jewelry".
-Return ONLY valid JSON. Example: {"isProduct":true,"query":"vintage watch"}`
+Return ONLY valid JSON. Example: {"isProduct":true,"query":"engagement ring"}`
         },
         { role: 'user', content: userMessage }
       ]
     });
-    const raw = res.choices[0].message.content.trim();
-    return JSON.parse(raw);
-  } catch {
-    return { isProduct: false, query: userMessage.toLowerCase() };
-  }
+    return JSON.parse(res.choices[0].message.content.trim());
+  } catch { return { isProduct: false, query: userMessage.toLowerCase() }; }
 }
 
-// ─── Format product for response ─────────────────────────────────────────────
+// Filter: exclude SOLD items and $0 products
+function isAvailable(p) {
+  const price = parseFloat(p.variants[0]?.price || 0);
+  return price > 0 && !p.title.toLowerCase().startsWith('sold');
+}
+
+// Parse price ceiling/floor from natural language
+function parsePriceFilters(msg) {
+  const maxMatch = msg.match(/(?:under|below|less\s+than|max|maximum|budget\s+of|up\s+to)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
+  const minMatch = msg.match(/(?:over|above|more\s+than|at\s+least|starting\s+from)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
+  return {
+    maxPrice: maxMatch ? parseFloat(maxMatch[1].replace(/,/g, '')) : null,
+    minPrice: minMatch ? parseFloat(minMatch[1].replace(/,/g, '')) : null
+  };
+}
+
 function formatProduct(p) {
   return {
     title: p.title,
@@ -139,78 +133,75 @@ function formatProduct(p) {
   };
 }
 
-// ─── Search products: live Shopify first, cache fallback ─────────────────────
 async function searchProducts(userMessage, preAnalyzedQuery = null) {
   try {
     const searchQuery = preAnalyzedQuery || (await analyzeMessage(userMessage)).query;
     console.log(`Search query: "${searchQuery}"`);
 
-    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage) || /mount/i.test(searchQuery);
-    const filterMountings = (list) => wantsMounting
-      ? list
-      : list.filter(p => !/\bmount(ing)?\b/i.test(p.title));
+    const { maxPrice, minPrice } = parsePriceFilters(userMessage);
+    if (maxPrice) console.log(`Price ceiling: $${maxPrice}`);
+    if (minPrice) console.log(`Price floor: $${minPrice}`);
 
-    // ── Sort intents: use full cached product list ─────────────────────────
+    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage) || /mount/i.test(searchQuery);
+
+    const applyFilters = (list) => {
+      let f = list.filter(isAvailable);
+      if (maxPrice) f = f.filter(p => parseFloat(p.variants[0]?.price || 0) <= maxPrice);
+      if (minPrice) f = f.filter(p => parseFloat(p.variants[0]?.price || 0) >= minPrice);
+      if (!wantsMounting) f = f.filter(p => !/\bmount(ing)?\b/i.test(p.title));
+      return f;
+    };
+
+    // Sort intents — use full cached list
     if (/cheap|affordable|budget|low price|lowest/.test(searchQuery)) {
       const all = await getAllProducts();
-      return filterMountings([...all].sort((a, b) =>
-        parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)
-      )).slice(0, 6).map(formatProduct);
+      return applyFilters(all).sort((a, b) => parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
     }
     if (/expensive|luxury|highest|most costly|priciest/.test(searchQuery)) {
       const all = await getAllProducts();
-      return filterMountings([...all].sort((a, b) =>
-        parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)
-      )).slice(0, 6).map(formatProduct);
+      return applyFilters(all).sort((a, b) => parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
     }
     if (/newest|latest|recent/.test(searchQuery)) {
       const all = await getAllProducts();
-      return filterMountings([...all].sort((a, b) =>
-        new Date(b.created_at) - new Date(a.created_at)
-      )).slice(0, 6).map(formatProduct);
+      return applyFilters(all).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 6).map(formatProduct);
     }
     if (/oldest|earliest/.test(searchQuery)) {
       const all = await getAllProducts();
-      return filterMountings([...all].sort((a, b) =>
-        new Date(a.created_at) - new Date(b.created_at)
-      )).slice(0, 6).map(formatProduct);
+      return applyFilters(all).sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(0, 6).map(formatProduct);
     }
 
-    // ── Live Shopify search for specific product queries ───────────────────
+    // Live Shopify search first
     const liveResults = await searchShopifyLive(searchQuery);
-    console.log(`Live Shopify results: ${liveResults.length}`);
-
+    console.log(`Live results: ${liveResults.length}`);
     if (liveResults.length > 0) {
-      const queryLower = searchQuery.toLowerCase();
-      const exact = liveResults.filter(p => p.title.toLowerCase().includes(queryLower));
-      const partial = liveResults.filter(p => !p.title.toLowerCase().includes(queryLower));
-      return filterMountings([...exact, ...partial]).slice(0, 6).map(formatProduct);
+      const cleanLive = applyFilters(liveResults);
+      if (cleanLive.length > 0) {
+        const qLower = searchQuery.toLowerCase();
+        const exact = cleanLive.filter(p => p.title.toLowerCase().includes(qLower));
+        const partial = cleanLive.filter(p => !p.title.toLowerCase().includes(qLower));
+        return [...exact, ...partial].slice(0, 6).map(formatProduct);
+      }
     }
 
-    // ── Fallback: search cached products ──────────────────────────────────
-    console.log('Live search empty, falling back to cache...');
+    // Fallback: scored cache search
+    console.log('Falling back to cache...');
     const allProducts = await getAllProducts();
+    const cleanAll = applyFilters(allProducts);
     const terms = searchQuery.split(' ').filter(t => t.length > 1);
-    const queryLower = searchQuery.toLowerCase();
+    const qLower = searchQuery.toLowerCase();
 
-    const scored = allProducts.map(p => {
-      const titleLower = p.title.toLowerCase();
-      const searchText = [p.title, p.product_type, p.tags,
-        p.body_html?.replace(/<[^>]*>/g, '') || ''].join(' ').toLowerCase();
+    const scored = cleanAll.map(p => {
+      const tLower = p.title.toLowerCase();
+      const text = [p.title, p.product_type, p.tags, p.body_html?.replace(/<[^>]*>/g, '') || ''].join(' ').toLowerCase();
       let score = 0;
-      if (titleLower.includes(queryLower)) score += 20;
-      if (terms.every(t => titleLower.includes(t)) && terms.length > 1) score += 10;
-      terms.forEach(term => {
-        if (titleLower.includes(term)) score += 3;
-        else if (searchText.includes(term)) score += 1;
-      });
+      if (tLower.includes(qLower)) score += 20;
+      if (terms.every(t => tLower.includes(t)) && terms.length > 1) score += 10;
+      terms.forEach(t => { if (tLower.includes(t)) score += 3; else if (text.includes(t)) score += 1; });
       return { product: p, score };
     });
 
-    const matched = scored.filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score).map(s => s.product);
-    const finalResults = matched.length > 0 ? matched : allProducts;
-    return filterMountings(finalResults).slice(0, 6).map(formatProduct);
+    const matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).map(s => s.product);
+    return (matched.length > 0 ? matched : cleanAll).slice(0, 6).map(formatProduct);
 
   } catch (err) {
     console.error('searchProducts error:', err);
@@ -218,42 +209,30 @@ async function searchProducts(userMessage, preAnalyzedQuery = null) {
   }
 }
 
-// ─── Chat endpoint ────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history = [] } = req.body;
-
-    // AI decides intent — zero hardcoding
     const { isProduct, query } = await analyzeMessage(message);
     console.log(`Intent: isProduct=${isProduct}, query="${query}"`);
 
     if (isProduct) {
       const products = await searchProducts(message, query);
-      if (products.length > 0) {
-        return res.json({ type: 'products', text: "Here are some pieces from our collection!", products });
-      }
+      if (products.length > 0) return res.json({ type: 'products', text: "Here are some pieces from our collection!", products });
       return res.json({ type: 'text', text: "I'd love to help you find something special! Could you tell me more about what you're looking for?" });
     }
 
     const reply = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       max_tokens: 300,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...history,
-        { role: 'user', content: message }
-      ]
+      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history, { role: 'user', content: message }]
     });
-
     res.json({ type: 'text', text: reply.choices[0].message.content });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Something went wrong' });
   }
 });
 
-// ─── Related products endpoint ────────────────────────────────────────────────
 app.post('/api/related', async (req, res) => {
   try {
     const { title, tags, product_type } = req.body;
@@ -261,63 +240,41 @@ app.post('/api/related', async (req, res) => {
     if (!allProducts.length) return res.json({ products: [] });
 
     const titleLower = (title || '').toLowerCase();
+    const available = allProducts.filter(isAvailable);
     const searchTerms = [
       ...(tags || '').split(',').map(t => t.trim().toLowerCase()).filter(t => t.length > 2),
-      (product_type || '').toLowerCase().trim(),
+      (product_type || '').toLowerCase().trim()
     ].filter(Boolean);
 
     if (searchTerms.length === 0) {
-      const fallback = [...allProducts]
-        .filter(p => p.title.toLowerCase() !== titleLower)
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-        .slice(0, 3).map(formatProduct);
-      return res.json({ products: fallback });
+      return res.json({ products: available.filter(p => p.title.toLowerCase() !== titleLower).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 3).map(formatProduct) });
     }
 
-    const scored = allProducts.map(p => {
+    const scored = available.map(p => {
       if (p.title.toLowerCase() === titleLower) return { product: p, score: -1 };
-      const searchText = [p.title, p.product_type, p.tags].join(' ').toLowerCase();
+      const text = [p.title, p.product_type, p.tags].join(' ').toLowerCase();
       let score = 0;
-      searchTerms.forEach(term => {
-        if (searchText.includes(term)) score++;
-        if (p.title.toLowerCase().includes(term)) score++;
-      });
+      searchTerms.forEach(t => { if (text.includes(t)) score++; if (p.title.toLowerCase().includes(t)) score++; });
       return { product: p, score };
     });
 
-    const matched = scored.filter(s => s.score > 0)
-      .sort((a, b) => b.score - a.score).slice(0, 3).map(s => formatProduct(s.product));
-
+    const matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).slice(0, 3).map(s => formatProduct(s.product));
     if (matched.length === 0) {
-      const fallback = [...allProducts]
-        .filter(p => p.title.toLowerCase() !== titleLower)
-        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-        .slice(0, 3).map(formatProduct);
-      return res.json({ products: fallback });
+      return res.json({ products: available.filter(p => p.title.toLowerCase() !== titleLower).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 3).map(formatProduct) });
     }
-
     res.json({ products: matched });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ─── Cache refresh ────────────────────────────────────────────────────────────
 app.post('/api/refresh-cache', async (req, res) => {
   try {
     const products = await fetchAllFromShopify();
     await redisSet(CACHE_KEY, products, CACHE_TTL);
     res.json({ success: true, count: products.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/', (req, res) => {
-  res.json({ status: 'Joella Grace Chat API is running!' });
-});
+app.get('/', (req, res) => { res.json({ status: 'Joella Grace Chat API is running!' }); });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
