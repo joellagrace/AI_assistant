@@ -14,7 +14,7 @@ const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const CACHE_KEY = 'jg_all_products';
-const CACHE_TTL = 60 * 30; // 30 minutes
+const CACHE_TTL = 60 * 5; // 5 minutes
 
 const SYSTEM_PROMPT = `You are a helpful shopping assistant for Joella Grace Jewelry,
 a vintage and antique jewelry store. Be warm, elegant and knowledgeable.
@@ -156,8 +156,10 @@ async function searchProducts(userMessage) {
       return results.slice(0, 4).map(formatProduct);
     }
 
-    // Score each product by how many terms match
+    // Score each product — exact phrase > title word match > any field match
+    const queryLower = searchQuery.toLowerCase();
     const scored = results.map(p => {
+      const titleLower = p.title.toLowerCase();
       const searchText = [
         p.title,
         p.product_type,
@@ -166,11 +168,20 @@ async function searchProducts(userMessage) {
       ].join(' ').toLowerCase();
 
       let score = 0;
+
+      // 1. Exact full phrase match in title — highest priority
+      if (titleLower.includes(queryLower)) score += 20;
+
+      // 2. All terms present in title
+      const allInTitle = terms.every(t => titleLower.includes(t));
+      if (allInTitle && terms.length > 1) score += 10;
+
+      // 3. Per-term scoring
       terms.forEach(term => {
-        if (searchText.includes(term)) score++;
-        // Bonus for title match
-        if (p.title.toLowerCase().includes(term)) score += 2;
+        if (titleLower.includes(term)) score += 3;      // title match
+        else if (searchText.includes(term)) score += 1; // any field match
       });
+
       return { product: p, score };
     });
 
