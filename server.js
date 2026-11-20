@@ -42,36 +42,70 @@ async function redisGet(key) {
 
 async function redisSet(key, value, ttl) {
   try {
-    await fetch(`${REDIS_URL}/set/${key}?EX=${ttl}`, {
+    const body = JSON.stringify(JSON.stringify(value));
+    const r = await fetch(`${REDIS_URL}/set/${key}?EX=${ttl}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(JSON.stringify(value))
+      body
     });
-  } catch { }
+    const ok = r.ok;
+    if (!ok) console.error(`redisSet failed: ${r.status} (${(body.length / 1048576).toFixed(2)} MB)`);
+    return { ok, bytes: body.length };
+  } catch (e) { console.error('redisSet error:', e.message); return { ok: false, bytes: 0 }; }
 }
 
 // ─── Fetch all products from Shopify Admin ────────────────────────────────────
+// Keep only the fields the search needs so the whole catalogue (5,000+ items)
+// fits comfortably in the Redis cache.
+function slimProduct(p) {
+  return {
+    id: p.id,
+    title: p.title,
+    handle: p.handle,
+    product_type: p.product_type,
+    tags: p.tags,
+    created_at: p.created_at,
+    body_html: (p.body_html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 400),
+    variants: (p.variants || []).slice(0, 3).map(v => ({
+      id: v.id,
+      price: v.price,
+      inventory_management: v.inventory_management,
+      inventory_quantity: v.inventory_quantity
+    })),
+    images: (p.images || []).slice(0, 1).map(i => ({ src: i.src }))
+  };
+}
+
 async function fetchAllFromShopify() {
   let allProducts = [];
-  let url = `${SHOPIFY_URL}/products.json?limit=250&status=active`;
-  while (url) {
+  const fields = 'id,title,handle,product_type,tags,created_at,body_html,variants,images';
+  let url = `${SHOPIFY_URL}/products.json?limit=250&status=active&fields=${fields}`;
+  let pages = 0;
+  while (url && pages < 100) {
     const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } });
+    if (!res.ok) throw new Error(`Shopify responded ${res.status} on page ${pages + 1}`);
     const data = await res.json();
-    if (data.products) allProducts = [...allProducts, ...data.products];
+    if (data.products) for (const p of data.products) allProducts.push(slimProduct(p));
     const linkHeader = res.headers.get('link');
     const nextMatch = linkHeader && linkHeader.match(/<([^>]+)>;\s*rel="next"/);
     url = nextMatch ? nextMatch[1] : null;
-    if (allProducts.length >= 5000) break;
+    pages++;
   }
+  console.log(`Fetched ${allProducts.length} products in ${pages} pages`);
   return allProducts;
 }
 
+let memCache = { at: 0, data: null };
 async function getAllProducts() {
   const cached = await redisGet(CACHE_KEY);
   if (cached && cached.length > 0) { console.log(`Cache hit: ${cached.length} products`); return cached; }
+  if (memCache.data && Date.now() - memCache.at < CACHE_TTL * 1000) { console.log(`Memory cache hit: ${memCache.data.length}`); return memCache.data; }
   console.log('Cache miss — fetching from Shopify...');
   const products = await fetchAllFromShopify();
-  if (products.length > 0) await redisSet(CACHE_KEY, products, CACHE_TTL);
+  if (products.length > 0) {
+    memCache = { at: Date.now(), data: products };
+    await redisSet(CACHE_KEY, products, CACHE_TTL);
+  }
   return products;
 }
 
@@ -338,8 +372,9 @@ app.post('/api/related', async (req, res) => {
 app.post('/api/refresh-cache', async (req, res) => {
   try {
     const products = await fetchAllFromShopify();
-    await redisSet(CACHE_KEY, products, CACHE_TTL);
-    res.json({ success: true, count: products.length });
+    memCache = { at: Date.now(), data: products };
+    const saved = await redisSet(CACHE_KEY, products, CACHE_TTL);
+    res.json({ success: true, count: products.length, redisSaved: saved.ok, megabytes: +(saved.bytes / 1048576).toFixed(2) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
