@@ -85,75 +85,60 @@ async function getAllProducts() {
   return products;
 }
 
-// ─── Step 1: Use OpenAI to extract a clean search query ──────────────────────
-async function extractSearchQuery(userMessage) {
+// ─── Step 1: Use OpenAI to detect intent AND extract search query ─────────────
+async function analyzeMessage(userMessage) {
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 60,
+      max_tokens: 80,
       messages: [
         {
           role: 'system',
-          content: `You are a search query extractor for a jewelry store.
-Extract a simple 1-3 word product search query from the user's message.
-Return ONLY the search query, nothing else.
-Examples:
-- "show me some ruby rings" → "ruby ring"
-- "I want something cheap" → "affordable"
-- "show me expensive pieces" → "expensive"
-- "do you have sapphire necklaces?" → "sapphire necklace"
-- "what engagement rings do you have" → "engagement ring"
-- "show me vintage bracelets" → "vintage bracelet"
-- "cheapest items" → "cheapest"
-- "most expensive" → "most expensive"
-- "newest arrivals" → "newest"
-If no clear product query, return "jewelry".`
+          content: `You are an assistant for a vintage jewelry and antiques store.
+Analyze the user message and return a JSON object with two fields:
+- "isProduct": true if the user is asking about, looking for, or inquiring about ANY product or item in the store (jewelry, watches, accessories, antiques, coins, etc.), false if it's a general question (shipping, returns, policies, custom design, greetings).
+- "query": a simple 1-3 word search term (e.g. "ruby ring", "watch", "affordable", "newest", "most expensive"). If no specific product, return "jewelry".
+Return ONLY valid JSON. Example: {"isProduct":true,"query":"vintage watch"}`
         },
         { role: 'user', content: userMessage }
       ]
     });
-    return res.choices[0].message.content.trim().toLowerCase();
+    const raw = res.choices[0].message.content.trim();
+    return JSON.parse(raw);
   } catch {
-    return userMessage.toLowerCase();
+    return { isProduct: false, query: userMessage.toLowerCase() };
   }
 }
 
 // ─── Step 2: Search products using extracted query ────────────────────────────
-async function searchProducts(userMessage) {
+async function searchProducts(userMessage, preAnalyzedQuery = null) {
   try {
     const allProducts = await getAllProducts();
     if (allProducts.length === 0) return [];
 
-    // Get AI-extracted search query
-    const searchQuery = await extractSearchQuery(userMessage);
+    // Use pre-analyzed query or extract fresh
+    const searchQuery = preAnalyzedQuery || (await analyzeMessage(userMessage)).query;
     console.log(`Search query: "${searchQuery}"`);
 
     const terms = searchQuery.split(' ').filter(t => t.length > 1);
     let results = [...allProducts];
 
-    // Handle sort intents
-    if (/cheap|lowest|affordable|budget|least expensive|low price/.test(searchQuery)) {
-      results.sort((a, b) =>
-        parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)
-      );
-      return results.slice(0, 4).map(formatProduct);
+    // Handle sort intents (AI will return these keywords in query)
+    if (/cheap|affordable|budget|low price|lowest/.test(searchQuery)) {
+      results.sort((a, b) => parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0));
+      return results.slice(0, 6).map(formatProduct);
     }
-
-    if (/expensive|highest|luxury|most costly|priciest|high end|high-end|most expensive/.test(searchQuery)) {
-      results.sort((a, b) =>
-        parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)
-      );
-      return results.slice(0, 4).map(formatProduct);
+    if (/expensive|luxury|highest|most costly|priciest/.test(searchQuery)) {
+      results.sort((a, b) => parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0));
+      return results.slice(0, 6).map(formatProduct);
     }
-
-    if (/new|latest|newest|recent/.test(searchQuery)) {
+    if (/newest|latest|recent/.test(searchQuery)) {
       results.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      return results.slice(0, 4).map(formatProduct);
+      return results.slice(0, 6).map(formatProduct);
     }
-
-    if (/old|oldest|classic|earliest/.test(searchQuery)) {
+    if (/oldest|earliest/.test(searchQuery)) {
       results.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-      return results.slice(0, 4).map(formatProduct);
+      return results.slice(0, 6).map(formatProduct);
     }
 
     // Score each product — exact phrase > title word match > any field match
@@ -192,7 +177,7 @@ async function searchProducts(userMessage) {
       .map(s => s.product);
 
     // Hide mountings unless user explicitly asked for them
-    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage);
+    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage) || /mount/i.test(searchQuery);
     const filterMountings = (list) => wantsMounting
       ? list
       : list.filter(p => !/\bmount(ing)?\b/i.test(p.title));
@@ -221,18 +206,19 @@ function formatProduct(p) {
   };
 }
 
-// ─── Is this a product query? ─────────────────────────────────────────────────
-function isProductQuery(msg) {
-  return /ring|necklace|earring|bracelet|pendant|brooch|diamond|gold|silver|platinum|vintage|antique|suggest|show me|find me|looking for|engagement|wedding|jewelry|jewellery|collection|piece|buy|shop|cheap|expensive|latest|newest|oldest|affordable|luxury|ruby|emerald|sapphire|pearl|opal|garnet|cross|coin|show|suggest|recommend/i.test(msg);
-}
+// ─── Product intent is now detected by AI (analyzeMessage) ───────────────────
 
 // ─── API endpoint ─────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history = [] } = req.body;
 
-    if (isProductQuery(message)) {
-      const products = await searchProducts(message);
+    // AI decides if this is a product query — no hardcoding
+    const { isProduct, query } = await analyzeMessage(message);
+    console.log(`Intent: isProduct=${isProduct}, query="${query}"`);
+
+    if (isProduct) {
+      const products = await searchProducts(message, query);
 
       if (products.length > 0) {
         return res.json({
