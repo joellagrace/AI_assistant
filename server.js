@@ -105,9 +105,18 @@ async function analyzeMessage(userMessage) {
           role: 'system',
           content: `You are an assistant for a vintage jewelry and antiques store.
 Analyze the user message and return a JSON object:
-- "isProduct": true if asking about any product/item (jewelry, watches, coins, antiques, etc.)
-- "query": 1-3 word search term (e.g. "diamond ring", "watch", "sapphire necklace"). If no specific product, return "jewelry".
-Return ONLY valid JSON. Example: {"isProduct":true,"query":"diamond ring"}`
+- "isProduct": true if the user wants to SEE, FIND, or BUY any item. When in doubt, return true.
+  TRUE examples: "show me watches", "do you have rings", "show me few watches", "need rings",
+  "any bracelets", "is there a necklace", "diamond stuff", "show me something cheap", "newest items"
+  FALSE examples: "what is your return policy", "how long does shipping take", "hello", "thank you"
+- "query": 1-3 word search using the most specific product noun.
+  "show me few watches" -> "watch"
+  "diamond rings under $1000" -> "diamond ring"
+  "do you have sapphire necklaces" -> "sapphire necklace"
+  "show me something cheap" -> "affordable"
+  "newest items" -> "newest"
+  If no specific type, return "jewelry".
+Return ONLY valid JSON. Example: {"isProduct":true,"query":"watch"}`
         },
         { role: 'user', content: userMessage }
       ]
@@ -275,7 +284,8 @@ app.post('/api/chat', async (req, res) => {
         const priceStr = maxPrice ? `under $${maxPrice.toLocaleString()}` : `over $${minPrice.toLocaleString()}`;
         return res.json({ type: 'text', text: `I couldn't find any available pieces ${priceStr} right now. Would you like me to show you our full collection, or try a different price range?` });
       }
-      return res.json({ type: 'text', text: "I'd love to help you find something special! Could you tell me more about what you're looking for?" });
+      // Honest message: we don't carry that item
+      return res.json({ type: 'text', text: `We don't currently have any "${query}" available in our collection. We specialize in vintage and antique rings, necklaces, earrings, bracelets, brooches, and more. Can I help you find something similar?` });
     }
 
     const reply = await openai.chat.completions.create({
