@@ -113,54 +113,49 @@ async function getAllProducts() {
   return products;
 }
 
-// ─── Shopify Predictive Search (same engine as the store's search bar) ────────
-// Returns product handles that Shopify considers most relevant
-async function shopifyPredictiveSearch(query) {
-  try {
-    const url = `https://${SHOPIFY_STORE}/search/suggest.json?q=${encodeURIComponent(query)}&resources[type]=product&resources[limit]=15`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const hits = data.resources?.results?.products || [];
-    // Returns array of { url, title, ... } — extract handles
-    return hits.map(h => {
-      const parts = h.url.split('/products/');
-      return parts[1] ? parts[1].split('?')[0] : null;
-    }).filter(Boolean);
-  } catch (err) {
-    console.error('Predictive search error:', err);
-    return [];
-  }
-}
-
-// ─── AI: intent + query ───────────────────────────────────────────────────────
+// ─── AI: intent + structured search filters ───────────────────────────────────
 async function analyzeMessage(userMessage) {
   try {
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 80,
+      max_tokens: 150,
+      temperature: 0,
+      response_format: { type: 'json_object' },
       messages: [
         {
           role: 'system',
-          content: `You are an assistant for a vintage jewelry and antiques store.
-Analyze the user message and return a JSON object:
-- "isProduct": true if the user wants to SEE, FIND, or BUY any item. When in doubt, return true.
-  TRUE examples: "show me watches", "do you have rings", "show me few watches", "need rings",
-  "any bracelets", "is there a necklace", "diamond stuff", "show me something cheap", "newest items"
-  FALSE examples: "what is your return policy", "how long does shipping take", "hello", "thank you"
-- "query": 1-3 word search using the most specific product noun.
-  "show me few watches" -> "watch"
-  "diamond rings under $1000" -> "diamond ring"
-  "do you have sapphire necklaces" -> "sapphire necklace"
-  "show me something cheap" -> "affordable"
-  "newest items" -> "newest"
-  If no specific type, return "jewelry".
-Return ONLY valid JSON. Example: {"isProduct":true,"query":"watch"}`
+          content: `You analyze messages sent to the chat assistant of a vintage jewelry and antiques store (rings, watches, necklaces, pendants, earrings, bracelets, brooches, cufflinks, charms, coins, etc.).
+Return a JSON object with exactly these fields:
+- "isProduct": true if the user wants to SEE, FIND, BROWSE or BUY any item (even vaguely, e.g. "something cheap", "gift for my wife", "newest items"). When in doubt return true. false only for policies, shipping, returns, custom-design questions, greetings, thanks.
+- "query": ONLY the product type and material/gem/style words, singular, lowercase, max 3 words (e.g. "diamond ring", "watch", "sapphire necklace", "gold bracelet"). Never include price, sorting or filler words. Use "" when no specific product type or material is named.
+- "sort": one of "relevance", "price_asc" (cheapest/lowest/affordable/budget), "price_desc" (most expensive/luxury/highest), "newest" (newest/latest/recent/new arrivals), "oldest". Default "relevance".
+- "maxPrice": number or null. "under $1000", "below 500", "$500 or less", "up to 2k", "less than 1k" -> that number (1k = 1000).
+- "minPrice": number or null. "over $5000", "above 2k", "at least 300", "starting from 1000" -> that number.
+  "between $1000 and $2000" -> minPrice 1000, maxPrice 2000. "around $2000" -> minPrice 1600, maxPrice 2400.
+Examples:
+"show me few watches" -> {"isProduct":true,"query":"watch","sort":"relevance","maxPrice":null,"minPrice":null}
+"cheapest diamond ring" -> {"isProduct":true,"query":"diamond ring","sort":"price_asc","maxPrice":null,"minPrice":null}
+"engagement rings under $1000" -> {"isProduct":true,"query":"engagement ring","sort":"relevance","maxPrice":1000,"minPrice":null}
+"newest items" -> {"isProduct":true,"query":"","sort":"newest","maxPrice":null,"minPrice":null}
+"what is your return policy" -> {"isProduct":false,"query":"","sort":"relevance","maxPrice":null,"minPrice":null}`
         },
         { role: 'user', content: userMessage }
       ]
     });
-    return JSON.parse(res.choices[0].message.content.trim());
-  } catch { return { isProduct: false, query: userMessage.toLowerCase() }; }
+    const j = JSON.parse(res.choices[0].message.content.trim());
+    const num = v => (typeof v === 'number' && isFinite(v) && v > 0 ? v : null);
+    const regex = parsePriceFilters(userMessage);
+    return {
+      isProduct: !!j.isProduct,
+      query: String(j.query || '').toLowerCase().trim(),
+      sort: ['price_asc', 'price_desc', 'newest', 'oldest'].includes(j.sort) ? j.sort : 'relevance',
+      maxPrice: num(j.maxPrice) ?? regex.maxPrice,
+      minPrice: num(j.minPrice) ?? regex.minPrice
+    };
+  } catch (e) {
+    console.error('analyzeMessage error:', e.message);
+    return { isProduct: false, query: '', sort: 'relevance', maxPrice: null, minPrice: null };
+  }
 }
 
 // ─── Availability filter ──────────────────────────────────────────────────────
@@ -200,106 +195,48 @@ function formatProduct(p) {
   };
 }
 
-// ─── Smart relevance scoring ──────────────────────────────────────────────────
-// Strict AND logic: all terms must appear for high score
-function scoreProduct(p, terms, exactPhrase) {
-  const title = p.title.toLowerCase();
-  const searchText = [p.title, p.product_type, p.tags, p.body_html?.replace(/<[^>]*>/g, '') || ''].join(' ').toLowerCase();
-  let score = 0;
+// ─── Search over the FULL cached catalogue ────────────────────────────────────
+const stem = t => t.replace(/ies$/, 'y').replace(/(ch|sh|x|ss)es$/, '$1').replace(/(?<!s)s$/, '');
+const priceOf = p => parseFloat(p.variants[0]?.price || 0);
 
-  // Exact full phrase in title = highest priority
-  if (title.includes(exactPhrase)) score += 50;
-
-  // ALL terms in title = strong match
-  if (terms.every(t => title.includes(t))) score += 30;
-
-  // ALL terms anywhere in product = decent match
-  if (terms.every(t => searchText.includes(t))) score += 15;
-
-  // Per-term scoring (partial matches)
-  terms.forEach(t => {
-    if (title.includes(t)) score += 5;
-    else if (searchText.includes(t)) score += 1;
-  });
-
-  return score;
-}
-
-// ─── Main search ──────────────────────────────────────────────────────────────
-async function searchProducts(userMessage, preAnalyzedQuery = null) {
+async function searchProducts(intent) {
   try {
-    const searchQuery = preAnalyzedQuery || (await analyzeMessage(userMessage)).query;
-    console.log(`Search query: "${searchQuery}"`);
-
-    const { maxPrice, minPrice } = parsePriceFilters(userMessage);
-    const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage) || /mount/i.test(searchQuery);
-
-    const applyFilters = (list) => {
-      let f = list.filter(isAvailable);
-      if (maxPrice) f = f.filter(p => parseFloat(p.variants[0]?.price || 0) <= maxPrice);
-      if (minPrice) f = f.filter(p => parseFloat(p.variants[0]?.price || 0) >= minPrice);
-      if (!wantsMounting) f = f.filter(p => !/\bmount(ing)?\b/i.test(p.title));
-      return f;
-    };
-
+    const { query, sort, maxPrice, minPrice } = intent;
+    const wantsMounting = /mount/i.test(query);
     const allProducts = await getAllProducts();
-    const terms = searchQuery.toLowerCase().split(' ').filter(t => t.length > 1);
-    const exactPhrase = searchQuery.toLowerCase();
 
-    // ── Sort intents ─────────────────────────────────────────────────────────
-    if (/cheap|affordable|budget|low price|lowest/.test(searchQuery)) {
-      return applyFilters(allProducts).sort((a, b) => parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
-    }
-    if (/expensive|luxury|highest|most costly|priciest/.test(searchQuery)) {
-      return applyFilters(allProducts).sort((a, b) => parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
-    }
-    if (/newest|latest|recent/.test(searchQuery)) {
-      return applyFilters(allProducts).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 6).map(formatProduct);
-    }
-    if (/oldest|earliest/.test(searchQuery)) {
-      return applyFilters(allProducts).sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(0, 6).map(formatProduct);
-    }
+    // 1) availability, price range, mountings
+    let pool = allProducts.filter(isAvailable);
+    if (maxPrice) pool = pool.filter(p => priceOf(p) <= maxPrice);
+    if (minPrice) pool = pool.filter(p => priceOf(p) >= minPrice);
+    if (!wantsMounting) pool = pool.filter(p => !/\bmount(ing)?\b/i.test(p.title));
 
-    // ── Step 1: Shopify Predictive Search — get relevant handles ─────────────
-    const predictiveHandles = await shopifyPredictiveSearch(searchQuery);
-    console.log(`Predictive search handles: ${predictiveHandles.length}`);
-
-    let finalList = [];
-
-    if (predictiveHandles.length > 0) {
-      // Map handles to full product objects from cache
-      const handleMap = new Map(allProducts.map(p => [p.handle, p]));
-      const predictiveProducts = predictiveHandles
-        .map(h => handleMap.get(h))
-        .filter(Boolean);
-
-      // Apply availability/price filters
-      const cleanPredictive = applyFilters(predictiveProducts);
-
-      if (cleanPredictive.length > 0) {
-        // Re-score within predictive results for better ordering
-        const scored = cleanPredictive.map(p => ({ product: p, score: scoreProduct(p, terms, exactPhrase) }));
-        scored.sort((a, b) => b.score - a.score);
-        finalList = scored.map(s => s.product);
-      }
+    // 2) strict AND match on every query term
+    const terms = query.split(/\s+/).map(stem).filter(t => t.length > 1);
+    let matched = pool;
+    if (terms.length > 0) {
+      const head = p => [p.title, p.product_type, p.tags].join(' ').toLowerCase();
+      const full = p => head(p) + ' ' + (p.body_html || '').toLowerCase();
+      matched = pool.filter(p => { const h = head(p); return terms.every(t => h.includes(t)); });
+      if (matched.length === 0) matched = pool.filter(p => { const f = full(p); return terms.every(t => f.includes(t)); });
+      const phrase = terms.join(' ');
+      const score = p => {
+        const t = p.title.toLowerCase();
+        return (t.includes(phrase) ? 50 : 0) + terms.filter(x => t.includes(x)).length * 10;
+      };
+      matched.sort((a, b) => score(b) - score(a) || new Date(b.created_at) - new Date(a.created_at));
+    } else {
+      matched = [...pool].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     }
 
-    // ── Step 2: If predictive gave nothing (or all filtered), use cache scoring
-    if (finalList.length === 0) {
-      console.log('Predictive empty/filtered — using cache scoring...');
-      const cleanAll = applyFilters(allProducts);
-      const scored = cleanAll.map(p => ({ product: p, score: scoreProduct(p, terms, exactPhrase) }));
-      // Strict: only show products where ALL terms matched somewhere (score > terms.length)
-      const minScore = terms.length > 1 ? terms.length * 2 : 1;
-      const matched = scored.filter(s => s.score >= minScore).sort((a, b) => b.score - a.score).map(s => s.product);
-      finalList = matched.length > 0 ? matched : cleanAll.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    }
+    // 3) requested ordering
+    if (sort === 'price_asc') matched.sort((a, b) => priceOf(a) - priceOf(b));
+    else if (sort === 'price_desc') matched.sort((a, b) => priceOf(b) - priceOf(a));
+    else if (sort === 'newest') matched.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    else if (sort === 'oldest') matched.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-    // If price filter gave no results, return empty (better UX than wrong products)
-    if ((maxPrice || minPrice) && finalList.length === 0) return [];
-
-    return finalList.slice(0, 6).map(formatProduct);
-
+    console.log(`Search "${query}" sort=${sort} max=${maxPrice} min=${minPrice} → ${matched.length} matches`);
+    return matched.slice(0, 6).map(formatProduct);
   } catch (err) {
     console.error('searchProducts error:', err);
     return [];
@@ -310,20 +247,21 @@ async function searchProducts(userMessage, preAnalyzedQuery = null) {
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history = [] } = req.body;
-    const { isProduct, query } = await analyzeMessage(message);
-    console.log(`Intent: isProduct=${isProduct}, query="${query}"`);
+    const intent = await analyzeMessage(message);
+    console.log('Intent:', JSON.stringify(intent));
 
-    if (isProduct) {
-      const products = await searchProducts(message, query);
+    if (intent.isProduct) {
+      const products = await searchProducts(intent);
       if (products.length > 0) return res.json({ type: 'products', text: "Here are some pieces from our collection!", products });
 
-      const { maxPrice, minPrice } = parsePriceFilters(message);
+      const { query, maxPrice, minPrice } = intent;
+      const fmt = n => '$' + n.toLocaleString('en-US');
+      const what = query ? `"${query}" pieces` : 'pieces';
       if (maxPrice || minPrice) {
-        const priceStr = maxPrice ? `under $${maxPrice.toLocaleString()}` : `over $${minPrice.toLocaleString()}`;
-        return res.json({ type: 'text', text: `I couldn't find any available pieces ${priceStr} right now. Would you like me to show you our full collection, or try a different price range?` });
+        const range = maxPrice && minPrice ? `between ${fmt(minPrice)} and ${fmt(maxPrice)}` : maxPrice ? `under ${fmt(maxPrice)}` : `over ${fmt(minPrice)}`;
+        return res.json({ type: 'text', text: `I couldn't find any available ${what} ${range} right now. Would you like to try a different price range?` });
       }
-      // Honest message: we don't carry that item
-      return res.json({ type: 'text', text: `We don't currently have any "${query}" available in our collection. We specialize in vintage and antique rings, necklaces, earrings, bracelets, brooches, and more. Can I help you find something similar?` });
+      return res.json({ type: 'text', text: `We don't currently have any ${what} available in our collection. We specialize in vintage and antique rings, necklaces, earrings, bracelets, brooches, watches, and more. Can I help you find something similar?` });
     }
 
     const reply = await openai.chat.completions.create({
