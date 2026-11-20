@@ -104,13 +104,20 @@ Return ONLY valid JSON. Example: {"isProduct":true,"query":"engagement ring"}`
   } catch { return { isProduct: false, query: userMessage.toLowerCase() }; }
 }
 
-// Filter: exclude SOLD items and $0 products
+// Filter: exclude SOLD, $0, and out-of-stock products
 function isAvailable(p) {
+  const title = p.title.toLowerCase();
   const price = parseFloat(p.variants[0]?.price || 0);
-  return price > 0 && !p.title.toLowerCase().startsWith('sold');
+  if (price <= 0) return false;
+  if (title.startsWith('sold')) return false;
+  // Check inventory — if Shopify tracks it, must have stock > 0
+  const hasStock = p.variants.some(v => {
+    if (v.inventory_management === null || v.inventory_management === 'none' || !v.inventory_management) return true;
+    return v.inventory_quantity > 0;
+  });
+  return hasStock;
 }
 
-// Parse price ceiling/floor from natural language
 function parsePriceFilters(msg) {
   const maxMatch = msg.match(/(?:under|below|less\s+than|max|maximum|budget\s+of|up\s+to)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
   const minMatch = msg.match(/(?:over|above|more\s+than|at\s+least|starting\s+from)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
@@ -201,6 +208,10 @@ async function searchProducts(userMessage, preAnalyzedQuery = null) {
     });
 
     const matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).map(s => s.product);
+
+    // If price filter gave no results, return message instead of random products
+    if ((maxPrice || minPrice) && matched.length === 0) return [];
+
     return (matched.length > 0 ? matched : cleanAll).slice(0, 6).map(formatProduct);
 
   } catch (err) {
@@ -218,6 +229,14 @@ app.post('/api/chat', async (req, res) => {
     if (isProduct) {
       const products = await searchProducts(message, query);
       if (products.length > 0) return res.json({ type: 'products', text: "Here are some pieces from our collection!", products });
+
+      // Check if price filter was the reason
+      const { maxPrice, minPrice } = parsePriceFilters(message);
+      if (maxPrice || minPrice) {
+        const priceStr = maxPrice ? `under $${maxPrice.toLocaleString()}` : `over $${minPrice.toLocaleString()}`;
+        return res.json({ type: 'text', text: `I couldn't find any available pieces ${priceStr} right now. Would you like me to show you our full collection, or try a different price range?` });
+      }
+
       return res.json({ type: 'text', text: "I'd love to help you find something special! Could you tell me more about what you're looking for?" });
     }
 
