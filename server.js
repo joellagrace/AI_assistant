@@ -215,15 +215,17 @@ async function searchProducts(intent) {
     const terms = query.split(/\s+/).map(stem).filter(t => t.length > 1);
     let matched = pool;
     if (terms.length > 0) {
-      const head = p => [p.title, p.product_type, p.tags].join(' ').toLowerCase();
-      const full = p => head(p) + ' ' + (p.body_html || '').toLowerCase();
-      matched = pool.filter(p => { const h = head(p); return terms.every(t => h.includes(t)); });
-      if (matched.length === 0) matched = pool.filter(p => { const f = full(p); return terms.every(t => f.includes(t)); });
-      const phrase = terms.join(' ');
-      const score = p => {
-        const t = p.title.toLowerCase();
-        return (t.includes(phrase) ? 50 : 0) + terms.filter(x => t.includes(x)).length * 10;
-      };
+      // Word-start matching: "ring" matches ring/rings but NOT earring/earrings
+      const esc = x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // Longer words (5+ letters) may also end a compound word: "watch" matches "Wristwatch"
+      const res = terms.map(t => new RegExp('\\b' + esc(t) + (t.length >= 5 ? '|(?<=[a-z])' + esc(t) + '(?:e?s)?\\b' : ''), 'i'));
+      const hasAll = text => res.every(r => r.test(text));
+      const head = p => [p.title, p.product_type, p.tags].join(' ');
+      const full = p => head(p) + ' ' + (p.body_html || '');
+      matched = pool.filter(p => hasAll(head(p)));
+      if (matched.length === 0) matched = pool.filter(p => hasAll(full(p)));
+      const phrase = new RegExp('\\b' + terms.map(esc).join('\\s+'), 'i');
+      const score = p => (phrase.test(p.title) ? 50 : 0) + res.filter(r => r.test(p.title)).length * 10;
       matched.sort((a, b) => score(b) - score(a) || new Date(b.created_at) - new Date(a.created_at));
     } else {
       matched = [...pool].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
