@@ -212,20 +212,27 @@ async function searchProducts(intent) {
     if (!wantsMounting) pool = pool.filter(p => !/\bmount(ing)?\b/i.test(p.title));
 
     // 2) strict AND match on every query term
-    const terms = query.split(/\s+/).map(stem).filter(t => t.length > 1);
+    const GENERIC = new Set(['jewelry', 'jewellery', 'piece', 'item', 'thing', 'stuff', 'product']);
+    const terms = query.split(/\s+/).map(stem).filter(t => t.length > 1 && !GENERIC.has(t));
     let matched = pool;
     if (terms.length > 0) {
-      // Word-start matching: "ring" matches ring/rings but NOT earring/earrings
       const esc = x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      // Longer words (5+ letters) may also end a compound word: "watch" matches "Wristwatch"
-      const res = terms.map(t => new RegExp('\\b' + esc(t) + (t.length >= 5 ? '|(?<=[a-z])' + esc(t) + '(?:e?s)?\\b' : ''), 'i'));
-      const hasAll = text => res.every(r => r.test(text));
-      const head = p => [p.title, p.product_type, p.tags].join(' ');
+      // Word-start matching: "ring" matches ring/rings but NOT earring/earrings.
+      // Longer words (5+ letters) may also end a compound word: "watch" matches "Wristwatch".
+      const rx = t => new RegExp('\\b' + esc(t) + (t.length >= 5 ? '|(?<=[a-z])' + esc(t) + '(?:e?s)?\\b' : ''), 'i');
+      const noun = terms[terms.length - 1];            // the product type, e.g. "ring" in "diamond ring"
+      const mods = terms.slice(0, -1);                 // adjectives: diamond, gold, pearl...
+      const nounRx = rx(noun), modRx = mods.map(rx);
+      // Category must be in the TITLE or PRODUCT TYPE — tags are too noisy (e.g. "1 percent earring" on rings)
+      const core = p => p.title + ' ' + (p.product_type || '');
+      const head = p => core(p) + ' ' + (p.tags || '');
       const full = p => head(p) + ' ' + (p.body_html || '');
-      matched = pool.filter(p => hasAll(head(p)));
-      if (matched.length === 0) matched = pool.filter(p => hasAll(full(p)));
+      const isType = pool.filter(p => nounRx.test(core(p)));
+      matched = isType.filter(p => modRx.every(r => r.test(head(p))));
+      if (matched.length === 0) matched = isType.filter(p => modRx.every(r => r.test(full(p))));
       const phrase = new RegExp('\\b' + terms.map(esc).join('\\s+'), 'i');
-      const score = p => (phrase.test(p.title) ? 50 : 0) + res.filter(r => r.test(p.title)).length * 10;
+      const all = terms.map(rx);
+      const score = p => (phrase.test(p.title) ? 50 : 0) + all.filter(r => r.test(p.title)).length * 10;
       matched.sort((a, b) => score(b) - score(a) || new Date(b.created_at) - new Date(a.created_at));
     } else {
       matched = [...pool].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
