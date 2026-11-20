@@ -10,6 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 const SHOPIFY_URL = `https://${process.env.SHOPIFY_STORE}/admin/api/2024-01`;
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -30,11 +31,10 @@ IMPORTANT: Never make up or invent product names, prices, or descriptions.
 If asked about specific products, only describe what you know about our store generally.
 Keep responses short, warm and friendly.`;
 
+// ─── Redis ────────────────────────────────────────────────────────────────────
 async function redisGet(key) {
   try {
-    const res = await fetch(`${REDIS_URL}/get/${key}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
+    const res = await fetch(`${REDIS_URL}/get/${key}`, { headers: { Authorization: `Bearer ${REDIS_TOKEN}` } });
     const data = await res.json();
     return data.result ? JSON.parse(data.result) : null;
   } catch { return null; }
@@ -50,6 +50,7 @@ async function redisSet(key, value, ttl) {
   } catch { }
 }
 
+// ─── Fetch all products from Shopify Admin ────────────────────────────────────
 async function fetchAllFromShopify() {
   let allProducts = [];
   let url = `${SHOPIFY_URL}/products.json?limit=250&status=active`;
@@ -74,15 +75,26 @@ async function getAllProducts() {
   return products;
 }
 
-async function searchShopifyLive(query) {
+// ─── Shopify Predictive Search (same engine as the store's search bar) ────────
+// Returns product handles that Shopify considers most relevant
+async function shopifyPredictiveSearch(query) {
   try {
-    const url = `${SHOPIFY_URL}/products.json?limit=15&status=active&title=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } });
+    const url = `https://${SHOPIFY_STORE}/search/suggest.json?q=${encodeURIComponent(query)}&resources[type]=product&resources[limit]=15`;
+    const res = await fetch(url);
     const data = await res.json();
-    return data.products || [];
-  } catch (err) { console.error('Shopify live search error:', err); return []; }
+    const hits = data.resources?.results?.products || [];
+    // Returns array of { url, title, ... } — extract handles
+    return hits.map(h => {
+      const parts = h.url.split('/products/');
+      return parts[1] ? parts[1].split('?')[0] : null;
+    }).filter(Boolean);
+  } catch (err) {
+    console.error('Predictive search error:', err);
+    return [];
+  }
 }
 
+// ─── AI: intent + query ───────────────────────────────────────────────────────
 async function analyzeMessage(userMessage) {
   try {
     const res = await openai.chat.completions.create({
@@ -92,10 +104,10 @@ async function analyzeMessage(userMessage) {
         {
           role: 'system',
           content: `You are an assistant for a vintage jewelry and antiques store.
-Analyze the user message and return a JSON object with two fields:
-- "isProduct": true if the user is asking about, looking for, or inquiring about ANY product or item in the store (jewelry, watches, accessories, antiques, coins, etc.), false if it's a general question (shipping, returns, policies, custom design, greetings).
-- "query": a simple 1-3 word search term (e.g. "ruby ring", "watch", "affordable", "newest", "most expensive"). If no specific product, return "jewelry".
-Return ONLY valid JSON. Example: {"isProduct":true,"query":"engagement ring"}`
+Analyze the user message and return a JSON object:
+- "isProduct": true if asking about any product/item (jewelry, watches, coins, antiques, etc.)
+- "query": 1-3 word search term (e.g. "diamond ring", "watch", "sapphire necklace"). If no specific product, return "jewelry".
+Return ONLY valid JSON. Example: {"isProduct":true,"query":"diamond ring"}`
         },
         { role: 'user', content: userMessage }
       ]
@@ -104,20 +116,21 @@ Return ONLY valid JSON. Example: {"isProduct":true,"query":"engagement ring"}`
   } catch { return { isProduct: false, query: userMessage.toLowerCase() }; }
 }
 
-// Filter: exclude SOLD, $0, and out-of-stock products
+// ─── Availability filter ──────────────────────────────────────────────────────
 function isAvailable(p) {
   const title = p.title.toLowerCase();
   const price = parseFloat(p.variants[0]?.price || 0);
   if (price <= 0) return false;
   if (title.startsWith('sold')) return false;
-  // Check inventory — if Shopify tracks it, must have stock > 0
+  // If Shopify tracks inventory, need stock > 0
   const hasStock = p.variants.some(v => {
-    if (v.inventory_management === null || v.inventory_management === 'none' || !v.inventory_management) return true;
+    if (!v.inventory_management || v.inventory_management === 'none') return true;
     return v.inventory_quantity > 0;
   });
   return hasStock;
 }
 
+// ─── Price filter parser ──────────────────────────────────────────────────────
 function parsePriceFilters(msg) {
   const maxMatch = msg.match(/(?:under|below|less\s+than|max|maximum|budget\s+of|up\s+to)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
   const minMatch = msg.match(/(?:over|above|more\s+than|at\s+least|starting\s+from)\s*\$?\s*(\d[\d,]*(?:\.\d{1,2})?)/i);
@@ -132,7 +145,7 @@ function formatProduct(p) {
     title: p.title,
     price: p.variants[0]?.price || '0.00',
     image: p.images[0]?.src || null,
-    url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`,
+    url: `https://${SHOPIFY_STORE}/products/${p.handle}`,
     inStock: p.variants.some(v => v.inventory_quantity > 0),
     tags: p.tags || '',
     product_type: p.product_type || '',
@@ -140,15 +153,38 @@ function formatProduct(p) {
   };
 }
 
+// ─── Smart relevance scoring ──────────────────────────────────────────────────
+// Strict AND logic: all terms must appear for high score
+function scoreProduct(p, terms, exactPhrase) {
+  const title = p.title.toLowerCase();
+  const searchText = [p.title, p.product_type, p.tags, p.body_html?.replace(/<[^>]*>/g, '') || ''].join(' ').toLowerCase();
+  let score = 0;
+
+  // Exact full phrase in title = highest priority
+  if (title.includes(exactPhrase)) score += 50;
+
+  // ALL terms in title = strong match
+  if (terms.every(t => title.includes(t))) score += 30;
+
+  // ALL terms anywhere in product = decent match
+  if (terms.every(t => searchText.includes(t))) score += 15;
+
+  // Per-term scoring (partial matches)
+  terms.forEach(t => {
+    if (title.includes(t)) score += 5;
+    else if (searchText.includes(t)) score += 1;
+  });
+
+  return score;
+}
+
+// ─── Main search ──────────────────────────────────────────────────────────────
 async function searchProducts(userMessage, preAnalyzedQuery = null) {
   try {
     const searchQuery = preAnalyzedQuery || (await analyzeMessage(userMessage)).query;
     console.log(`Search query: "${searchQuery}"`);
 
     const { maxPrice, minPrice } = parsePriceFilters(userMessage);
-    if (maxPrice) console.log(`Price ceiling: $${maxPrice}`);
-    if (minPrice) console.log(`Price floor: $${minPrice}`);
-
     const wantsMounting = /mount|mounting|semi.mount/i.test(userMessage) || /mount/i.test(searchQuery);
 
     const applyFilters = (list) => {
@@ -159,60 +195,63 @@ async function searchProducts(userMessage, preAnalyzedQuery = null) {
       return f;
     };
 
-    // Sort intents — use full cached list
+    const allProducts = await getAllProducts();
+    const terms = searchQuery.toLowerCase().split(' ').filter(t => t.length > 1);
+    const exactPhrase = searchQuery.toLowerCase();
+
+    // ── Sort intents ─────────────────────────────────────────────────────────
     if (/cheap|affordable|budget|low price|lowest/.test(searchQuery)) {
-      const all = await getAllProducts();
-      return applyFilters(all).sort((a, b) => parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
+      return applyFilters(allProducts).sort((a, b) => parseFloat(a.variants[0]?.price || 0) - parseFloat(b.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
     }
     if (/expensive|luxury|highest|most costly|priciest/.test(searchQuery)) {
-      const all = await getAllProducts();
-      return applyFilters(all).sort((a, b) => parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
+      return applyFilters(allProducts).sort((a, b) => parseFloat(b.variants[0]?.price || 0) - parseFloat(a.variants[0]?.price || 0)).slice(0, 6).map(formatProduct);
     }
     if (/newest|latest|recent/.test(searchQuery)) {
-      const all = await getAllProducts();
-      return applyFilters(all).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 6).map(formatProduct);
+      return applyFilters(allProducts).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 6).map(formatProduct);
     }
     if (/oldest|earliest/.test(searchQuery)) {
-      const all = await getAllProducts();
-      return applyFilters(all).sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(0, 6).map(formatProduct);
+      return applyFilters(allProducts).sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(0, 6).map(formatProduct);
     }
 
-    // Live Shopify search first
-    const liveResults = await searchShopifyLive(searchQuery);
-    console.log(`Live results: ${liveResults.length}`);
-    if (liveResults.length > 0) {
-      const cleanLive = applyFilters(liveResults);
-      if (cleanLive.length > 0) {
-        const qLower = searchQuery.toLowerCase();
-        const exact = cleanLive.filter(p => p.title.toLowerCase().includes(qLower));
-        const partial = cleanLive.filter(p => !p.title.toLowerCase().includes(qLower));
-        return [...exact, ...partial].slice(0, 6).map(formatProduct);
+    // ── Step 1: Shopify Predictive Search — get relevant handles ─────────────
+    const predictiveHandles = await shopifyPredictiveSearch(searchQuery);
+    console.log(`Predictive search handles: ${predictiveHandles.length}`);
+
+    let finalList = [];
+
+    if (predictiveHandles.length > 0) {
+      // Map handles to full product objects from cache
+      const handleMap = new Map(allProducts.map(p => [p.handle, p]));
+      const predictiveProducts = predictiveHandles
+        .map(h => handleMap.get(h))
+        .filter(Boolean);
+
+      // Apply availability/price filters
+      const cleanPredictive = applyFilters(predictiveProducts);
+
+      if (cleanPredictive.length > 0) {
+        // Re-score within predictive results for better ordering
+        const scored = cleanPredictive.map(p => ({ product: p, score: scoreProduct(p, terms, exactPhrase) }));
+        scored.sort((a, b) => b.score - a.score);
+        finalList = scored.map(s => s.product);
       }
     }
 
-    // Fallback: scored cache search
-    console.log('Falling back to cache...');
-    const allProducts = await getAllProducts();
-    const cleanAll = applyFilters(allProducts);
-    const terms = searchQuery.split(' ').filter(t => t.length > 1);
-    const qLower = searchQuery.toLowerCase();
+    // ── Step 2: If predictive gave nothing (or all filtered), use cache scoring
+    if (finalList.length === 0) {
+      console.log('Predictive empty/filtered — using cache scoring...');
+      const cleanAll = applyFilters(allProducts);
+      const scored = cleanAll.map(p => ({ product: p, score: scoreProduct(p, terms, exactPhrase) }));
+      // Strict: only show products where ALL terms matched somewhere (score > terms.length)
+      const minScore = terms.length > 1 ? terms.length * 2 : 1;
+      const matched = scored.filter(s => s.score >= minScore).sort((a, b) => b.score - a.score).map(s => s.product);
+      finalList = matched.length > 0 ? matched : cleanAll.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    }
 
-    const scored = cleanAll.map(p => {
-      const tLower = p.title.toLowerCase();
-      const text = [p.title, p.product_type, p.tags, p.body_html?.replace(/<[^>]*>/g, '') || ''].join(' ').toLowerCase();
-      let score = 0;
-      if (tLower.includes(qLower)) score += 20;
-      if (terms.every(t => tLower.includes(t)) && terms.length > 1) score += 10;
-      terms.forEach(t => { if (tLower.includes(t)) score += 3; else if (text.includes(t)) score += 1; });
-      return { product: p, score };
-    });
+    // If price filter gave no results, return empty (better UX than wrong products)
+    if ((maxPrice || minPrice) && finalList.length === 0) return [];
 
-    const matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).map(s => s.product);
-
-    // If price filter gave no results, return message instead of random products
-    if ((maxPrice || minPrice) && matched.length === 0) return [];
-
-    return (matched.length > 0 ? matched : cleanAll).slice(0, 6).map(formatProduct);
+    return finalList.slice(0, 6).map(formatProduct);
 
   } catch (err) {
     console.error('searchProducts error:', err);
@@ -220,6 +259,7 @@ async function searchProducts(userMessage, preAnalyzedQuery = null) {
   }
 }
 
+// ─── Chat endpoint ────────────────────────────────────────────────────────────
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, history = [] } = req.body;
@@ -230,13 +270,11 @@ app.post('/api/chat', async (req, res) => {
       const products = await searchProducts(message, query);
       if (products.length > 0) return res.json({ type: 'products', text: "Here are some pieces from our collection!", products });
 
-      // Check if price filter was the reason
       const { maxPrice, minPrice } = parsePriceFilters(message);
       if (maxPrice || minPrice) {
         const priceStr = maxPrice ? `under $${maxPrice.toLocaleString()}` : `over $${minPrice.toLocaleString()}`;
         return res.json({ type: 'text', text: `I couldn't find any available pieces ${priceStr} right now. Would you like me to show you our full collection, or try a different price range?` });
       }
-
       return res.json({ type: 'text', text: "I'd love to help you find something special! Could you tell me more about what you're looking for?" });
     }
 
@@ -252,6 +290,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ─── Related products ─────────────────────────────────────────────────────────
 app.post('/api/related', async (req, res) => {
   try {
     const { title, tags, product_type } = req.body;
@@ -285,6 +324,7 @@ app.post('/api/related', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─── Cache refresh ────────────────────────────────────────────────────────────
 app.post('/api/refresh-cache', async (req, res) => {
   try {
     const products = await fetchAllFromShopify();
